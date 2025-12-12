@@ -17,6 +17,15 @@ from utilities.utils import format_time
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 
+def collate_single(x):
+    """
+    Collate function that extracts the single item from a batch.
+
+    Enables multiprocessing to work on MacOS
+    """
+    return x[0]
+
+
 @torch.inference_mode()
 def main(
     model: CQTNet,
@@ -28,9 +37,13 @@ def main(
 ):
 
     if granularity == "chunk":
-        assert overlap is not None, "Overlap must be specified for chunk granularity."
+        assert (
+            overlap is not None
+        ), "Overlap must be specified for chunk granularity."
         assert 0 <= overlap < 1, "Overlap must be in [0,1)"
-        W = int(loader.dataset.context_length // loader.dataset.downsample_factor)
+        W = int(
+            loader.dataset.context_length // loader.dataset.downsample_factor
+        )
         H = int(W * (1 - overlap))
 
     device = next(model.parameters()).device
@@ -50,7 +63,9 @@ def main(
         if granularity == "track":
             cqt = cqt.unsqueeze(0).unsqueeze(1)  # (F,T) -> (1,1,F,T)
         elif granularity == "chunk":
-            cqt = cqt.unfold(dimension=-1, size=W, step=H)  # (F,T) -> (F, N, W)
+            cqt = cqt.unfold(
+                dimension=-1, size=W, step=H
+            )  # (F,T) -> (F, N, W)
             cqt = cqt.permute(1, 0, 2)  # (N,F,W)
             cqt = cqt.unsqueeze(1)  # (N,1,F,W)
         else:
@@ -63,7 +78,9 @@ def main(
             ):
                 embedding = model(cqt.to(device))  # (N, D)
         except Exception as e:
-            print(f"Error at {str(path_audio)} during embedding extraction: {repr(e)}")
+            print(
+                f"Error at {str(path_audio)} during embedding extraction: {repr(e)}"
+            )
             continue
 
         # Convert to numpy and save
@@ -86,7 +103,8 @@ def main(
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "input_dir",
@@ -168,19 +186,31 @@ if __name__ == "__main__":
         config = yaml.safe_load(f)
     print("\033[36m\nExperiment Configuration:\033[0m")
     print(
-        "\033[36m" + yaml.dump(config, indent=4, width=120, sort_keys=False) + "\033[0m"
+        "\033[36m"
+        + yaml.dump(config, indent=4, width=120, sort_keys=False)
+        + "\033[0m"
     )
 
-    if args.no_gpu or (not torch.cuda.is_available()):
+    if args.no_gpu:
         device = torch.device("cpu")
         # If no GPU is available, disable AMP
         amp = False
-    else:
+    elif torch.cuda.is_available():
         device = torch.device("cuda:0")
         if args.disable_amp:
             amp = False
         else:
             amp = config["TRAIN"]["AUTOMATIC_MIXED_PRECISION"]
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        # MPS supports float16 autocast as of PyTorch 2.1+
+        if args.disable_amp:
+            amp = False
+        else:
+            amp = config["TRAIN"]["AUTOMATIC_MIXED_PRECISION"]
+    else:
+        device = torch.device("cpu")
+        amp = False
     print(f"\033[31mDevice: {device}\033[0m")
     print(
         f"\033[31mAutomatic Mixed Precision {'enabled' if amp else 'disabled'}.\033[0m"
@@ -190,8 +220,10 @@ if __name__ == "__main__":
     model = load_model(config, device=device, mode="infer")
 
     # Build the input output pairs while preserving relative paths
-    all_paths = list(args.input_dir.rglob("*.wav"))
-    print(f"Found {len(all_paths):,} .wav files.")
+    all_paths = [
+        p for ext in ("*.wav", "*.mp3") for p in args.input_dir.rglob(ext)
+    ]
+    print(f"Found {len(all_paths):,} audio files.")
     path_pairs = []
     for input_path in all_paths:
         output_path = (
@@ -202,7 +234,9 @@ if __name__ == "__main__":
     # partition the files
     if args.num_partitions > 1:
         path_pairs = path_pairs[args.partition :: args.num_partitions]
-        print(f"Partition {args.partition} will process {len(path_pairs):,} files")
+        print(
+            f"Partition {args.partition} will process {len(path_pairs):,} files"
+        )
 
     # Create the dataset and the DataLoader
     dataset = InferenceDataset(
@@ -217,7 +251,8 @@ if __name__ == "__main__":
         drop_last=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        collate_fn=lambda x: x[0],
+        #        collate_fn=lambda x: x[0],
+        collate_fn=collate_single,
     )
 
     main(
